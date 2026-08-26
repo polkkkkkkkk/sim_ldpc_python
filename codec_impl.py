@@ -5,6 +5,8 @@ LDPC codecs implementation
 import os
 import sys
 
+import numpy as np
+
 from simulator_awgn_python.tools import load_json
 from simulator_awgn_python.channel import random_bits
 
@@ -33,26 +35,95 @@ class BinaryCodecBase:
         config = load_json(os.path.join(src_dir, code_filename))
         # Load generator and parity check matrices
 
+        self.is_nr = 'payload_length' in config
+
         # Get a unique name for a dedicated filename
         self.name = config.get('name', '')
 
         # Punctured positions: always assumed to be first
-        self.punctured = int(config.get('punctured', 0))
+        self.punctured = int(
+            config.get('punctured', config.get('punctured_prefix', 0))
+        )
 
         # For systematic code, evaluate FER using the first k positions
         # Use a whole codeword otherwise
-        self.is_systematic = config.get('is_systematic', False)
+        is_systematic = config.get('is_systematic', False)
+        if isinstance(is_systematic, str):
+            is_systematic = is_systematic.lower() == 'true'
+        self.is_systematic = bool(is_systematic)
 
         # Read the shape of the parity check matrix
         self.alist_path = os.path.join(src_dir, config.get('pcm'))
         self.pcm_shape = Alist.read_shape(self.alist_path)
 
+        if self.is_nr:
+            self.base_graph = int(config['base_graph'])
+            self.lifting_size = int(config['lifting_size'])
+            self.payload_length = int(config['payload_length'])
+            self.systematic_length = int(config['systematic_length'])
+            self.mother_length = int(config['mother_length'])
+            self.punctured_prefix = int(
+                config.get('punctured_prefix', self.punctured)
+            )
+            self.rm_input_length = int(
+                config.get(
+                    'rm_input_length',
+                    self.mother_length - self.punctured_prefix
+                )
+            )
+            self.filler_mask = np.asarray(config['filler_mask'], dtype=bool)
+            self.payload_indices = np.arange(
+                self.payload_length,
+                dtype=np.int64
+            )
+            if self.payload_length <= 0:
+                raise ValueError('Payload length must be positive')
+            if self.base_graph not in (1, 2) or self.lifting_size <= 0:
+                raise ValueError('Invalid NR base graph parameters')
+            if not self.payload_length <= self.systematic_length <= self.mother_length:
+                raise ValueError('Invalid NR code lengths')
+            if self.mother_length != self.pcm_shape[1]:
+                raise ValueError('NR mother length / parity check matrix mismatch')
+            expected_mother_length = (
+                68 if self.base_graph == 1 else 52
+            ) * self.lifting_size
+            expected_systematic_length = (
+                22 if self.base_graph == 1 else 10
+            ) * self.lifting_size
+            expected_prefix = 2 * self.lifting_size
+            if self.mother_length != expected_mother_length:
+                raise ValueError('NR mother length / BG and Zc mismatch')
+            if self.systematic_length != expected_systematic_length:
+                raise ValueError('NR systematic length / BG and Zc mismatch')
+            if self.punctured_prefix != expected_prefix:
+                raise ValueError('NR punctured prefix / Zc mismatch')
+            if self.punctured != self.punctured_prefix:
+                raise ValueError('NR punctured metadata mismatch')
+            if self.rm_input_length != self.mother_length - self.punctured_prefix:
+                raise ValueError('NR rate-matching input length mismatch')
+            if self.filler_mask.shape != (self.mother_length,):
+                raise ValueError('NR filler mask / mother length mismatch')
+            expected_filler = np.zeros(self.mother_length, dtype=bool)
+            expected_filler[self.payload_length:self.systematic_length] = True
+            if not np.array_equal(self.filler_mask, expected_filler):
+                raise ValueError('NR filler mask has unexpected positions')
+            filler = config.get('filler', {})
+            if (
+                int(filler.get('start', self.payload_length)) != self.payload_length
+                or int(filler.get('stop', self.systematic_length)) != self.systematic_length
+            ):
+                raise ValueError('NR filler metadata has unexpected range')
+
         # Read the generator matrix and initialize the encoder:
         generator_path = config.get('generator', None)
+        if self.is_nr and generator_path is None:
+            raise ValueError('NR code metadata requires a generator matrix')
         if generator_path is not None:
             self.encoder = LBCEncoder(os.path.join(src_dir, generator_path))
             if self.pcm_shape[1] != self.encoder.cwd_length:
                 raise ValueError('Generator / parity check matrices shape mismatch')
+            if self.is_nr and self.encoder.inf_bits != self.systematic_length:
+                raise ValueError('NR generator / systematic length mismatch')
 
         self.decoder_impl = None  # To be instantiated by subclass
 
@@ -61,8 +132,32 @@ class BinaryCodecBase:
         Generate the information word and codeword
         return: codeword
         """
+        if not self.is_nr:
+            random_bits(iwd, rng)
+            self.encoder.encode(iwd, cwd)
+            return
+
+        if iwd.shape != (self.payload_length,):
+            raise ValueError('NR payload buffer has an unexpected length')
+        if cwd.shape != (self.mother_length,):
+            raise ValueError('NR codeword buffer has an unexpected length')
+
         random_bits(iwd, rng)
-        self.encoder.encode(iwd, cwd)
+        systematic = np.zeros(self.systematic_length, dtype=np.uint8)
+        systematic[:self.payload_length] = iwd
+        self.encoder.encode(systematic, cwd)
+
+    def get_payload_length(self):
+        """Return the number of payload bits used for BER evaluation."""
+        if self.is_nr:
+            return self.payload_length
+        return self.get_inf_bits_count()
+
+    def get_payload_indices(self):
+        """Return payload positions in the systematic codeword."""
+        if self.is_nr:
+            return self.payload_indices.copy()
+        return np.arange(self.get_payload_length(), dtype=np.int64)
 
     def block_length(self):
         """
@@ -287,6 +382,8 @@ class BinaryLdpcSoftCodec(BinarySoftCodecBase):
         Get the information bit count for correct coding rate evaluation
         Warning: parity check matrix is assumed to be of full rank
         """
+        if self.is_nr:
+            return self.payload_length
         return self.pcm_shape[1] - self.pcm_shape[0]
 
     def decode(self, llr_in, llr_out):

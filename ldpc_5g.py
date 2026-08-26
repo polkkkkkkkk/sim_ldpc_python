@@ -13,6 +13,13 @@ from ldpc_soft_py.bin_pcm_tools import expand_pcm
 
 CODES_DIR = 'codes'
 
+ALLOWED_ZC = sorted({
+    2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+    18, 20, 22, 24, 26, 28, 30, 32, 36, 40, 44, 48, 52, 56,
+    60, 64, 72, 80, 88, 96, 104, 112, 120, 128, 144, 160,
+    176, 192, 208, 224, 240, 256, 288, 320, 352, 384, 576
+})
+
 
 def factor_to_index(lifting_size):
     """
@@ -38,16 +45,74 @@ def factor_to_index(lifting_size):
     raise ValueError('Can not get set index for factor ', lifting_size)
 
 
-def gen_pcm(block_len, rate, base_graph):
+def choose_lifting_size(payload_length, base_graph):
+    """
+    Select the smallest supported Zc for the requested payload length K'.
+    """
+    if not isinstance(payload_length, (int, np.integer)) or payload_length <= 0:
+        raise ValueError('Payload length must be a positive integer')
+    if base_graph == 1:
+        k_base = 22
+    elif base_graph == 2:
+        if payload_length <= 192:
+            k_base = 6
+        elif payload_length <= 560:
+            k_base = 8
+        elif payload_length <= 640:
+            k_base = 9
+        else:
+            k_base = 10
+    else:
+        raise ValueError('Unknown base graph value')
+
+    for lifting_size in ALLOWED_ZC:
+        if k_base * lifting_size >= payload_length:
+            return lifting_size
+
+    raise ValueError(
+        f'Payload length {payload_length} is too large for BG{base_graph}'
+    )
+
+
+def gen_pcm(payload_length, base_graph):
     """
     Generate parity check matrix
     """
-    n_inf_bits = int(np.round(block_len * rate))
-    pcm_exp, k_base = get_pcm_expander(n_inf_bits, base_graph)
-    n_base = round(k_base / rate + 2)
-    pcm_exp = pcm_exp[:(n_base - k_base), : n_base]
-    factor = round(n_inf_bits / k_base)
-    return expand_pcm(factor, pcm_exp).astype(np.uint8), k_base, factor
+    bg_data, _ = get_pcm_expander(base_graph)
+    expected_shape = (46, 68) if base_graph == 1 else (42, 52)
+    pcm_base = np.asarray(bg_data['H'])
+    if pcm_base.shape != expected_shape:
+        raise ValueError(
+            f'Base graph {base_graph} must have shape {expected_shape}, '
+            f'got {pcm_base.shape}'
+        )
+
+    k_base = 22 if base_graph == 1 else 10
+    lifting_size = choose_lifting_size(payload_length, base_graph)
+    lift_index = factor_to_index(lifting_size)
+    pcm_exp = np.array(bg_data['sets'][str(lift_index)])
+    if pcm_exp.shape != expected_shape:
+        raise ValueError(
+            f'Lifting set {lift_index} for BG{base_graph} must have shape '
+            f'{expected_shape}, got {pcm_exp.shape}'
+        )
+
+    pcm = expand_pcm(lifting_size, pcm_exp).astype(np.uint8)
+    systematic_length = k_base * lifting_size
+    mother_length = pcm.shape[1]
+    expected_pcm_shape = (
+        (46 * lifting_size, 68 * lifting_size)
+        if base_graph == 1
+        else (42 * lifting_size, 52 * lifting_size)
+    )
+    if pcm.shape != expected_pcm_shape:
+        raise ValueError(
+            f'Expanded BG{base_graph} must have shape {expected_pcm_shape}, '
+            f'got {pcm.shape}'
+        )
+    filler_mask = np.zeros(mother_length, dtype=bool)
+    filler_mask[payload_length:systematic_length] = True
+    return pcm, k_base, lifting_size, filler_mask
 
 
 def get_generator(pcm, k_base, factor):
@@ -64,7 +129,42 @@ def get_generator(pcm, k_base, factor):
     return np.mod(generator_l @ generator_r, 2).astype(np.uint8)
 
 
-def get_pcm_expander(n_inf_bits, base_graph):
+# def get_pcm_expander(n_inf_bits, base_graph):
+#     """
+#     Get parity check matrix in the expander form
+#     """
+#     # Load base-graph
+#     if base_graph not in [1, 2]:
+#         raise ValueError('Unknown base graph value')
+#     with open(f'ldpc_5g_data/bg{base_graph}.json', 'r', encoding='utf-8') as filedesc:
+#         bg_data = json.load(filedesc)
+
+#     pcm_base = np.array(bg_data['H'])
+#     kb_max = pcm_base.shape[1] - pcm_base.shape[0]
+#     # Cases below correspond to base graph 2
+#     if n_inf_bits > 640:
+#         k_base = kb_max
+#     elif n_inf_bits > 560:
+#         k_base = 9
+#     elif n_inf_bits > 192:
+#         k_base = 8
+#     else:
+#         k_base = 6
+
+#     # For base graph 1, k_base = 22 for all cases
+#     if base_graph == 1:
+#         k_base = kb_max
+#     factor = int(np.round(n_inf_bits / k_base))
+
+#     print(f'Factor: {factor}, K_b = {k_base}.')
+#     print(f'K = {n_inf_bits}/{k_base * factor} (intended/actual)')
+#     lift_index = factor_to_index(factor)
+#     print(f'Index: {lift_index}.')
+
+#     pcm_expander = np.array(bg_data['sets'][str(lift_index)])
+#     return np.hstack([pcm_expander[:, :k_base], pcm_expander[:, kb_max:]]), k_base
+
+def get_pcm_expander(base_graph):
     """
     Get parity check matrix in the expander form
     """
@@ -76,28 +176,11 @@ def get_pcm_expander(n_inf_bits, base_graph):
 
     pcm_base = np.array(bg_data['H'])
     kb_max = pcm_base.shape[1] - pcm_base.shape[0]
-    # Cases below correspond to base graph 2
-    if n_inf_bits > 640:
-        k_base = kb_max
-    elif n_inf_bits > 560:
-        k_base = 9
-    elif n_inf_bits > 192:
-        k_base = 8
-    else:
-        k_base = 6
 
-    # For base graph 1, k_base = 22 for all cases
-    if base_graph == 1:
-        k_base = kb_max
-    factor = int(np.round(n_inf_bits / k_base))
+    return bg_data, kb_max
 
-    print(f'Factor: {factor}, K_b = {k_base}.')
-    print(f'K = {n_inf_bits}/{k_base * factor} (intended/actual)')
-    lift_index = factor_to_index(factor)
-    print(f'Index: {lift_index}.')
 
-    pcm_expander = np.array(bg_data['sets'][str(lift_index)])
-    return np.hstack([pcm_expander[:, :k_base], pcm_expander[:, kb_max:]]), k_base
+
 
 
 def get_filename_template(pcm, factor):
@@ -121,28 +204,42 @@ def generate_5g_code(inf_bits_count, coding_rate, base_graph):
     """
     # Generate parity check matrix:
     print('Creating the parity check matrix...')
-    pcm, k_base, factor = gen_pcm(
-        int(inf_bits_count / coding_rate),
-        coding_rate,
+    pcm, k_base, lifting_size, filler_mask = gen_pcm(
+        int(inf_bits_count),
         base_graph
     )
-    filename_template = get_filename_template(pcm, factor)
+    filename_template = get_filename_template(pcm, lifting_size)
 
     pcm_file = filename_template + '_pcm.alist'
     Alist.write(pcm, os.path.join(CODES_DIR, pcm_file))
     print('Creating the generator matrix...')
     try:
-        generator_mtx = get_generator(pcm, k_base, factor)
+        generator_mtx = get_generator(pcm, k_base, lifting_size)
         gen_mtx_file = filename_template + '_generator.txt'
         np.savetxt(os.path.join(CODES_DIR, gen_mtx_file), generator_mtx, delimiter=' ', fmt='%d')
     except KeyboardInterrupt:
         print('Interrupted. Generator matrix will not be created')
         gen_mtx_file = None
 
+    systematic_length = k_base * lifting_size
+    mother_length = pcm.shape[1]
+    punctured_prefix = 2 * lifting_size
     code = {
         'pcm': filename_template + '_pcm.alist',
-        'punctured': f'{2 * factor}',
-        'is_systematic': 'True'
+        'punctured': punctured_prefix,
+        'is_systematic': True,
+        'base_graph': base_graph,
+        'lifting_size': lifting_size,
+        'payload_length': int(inf_bits_count),
+        'systematic_length': systematic_length,
+        'mother_length': mother_length,
+        'rm_input_length': mother_length - punctured_prefix,
+        'punctured_prefix': punctured_prefix,
+        'filler': {
+            'start': int(inf_bits_count),
+            'stop': systematic_length
+        },
+        'filler_mask': filler_mask.tolist()
     }
     if gen_mtx_file:
         code['generator'] = gen_mtx_file
@@ -152,6 +249,7 @@ def generate_5g_code(inf_bits_count, coding_rate, base_graph):
         json.dump(code, filedesc, indent=2)
     print(f'Successfully generated {json_file}')
     return json_file
+
 
 
 if __name__ == '__main__':
