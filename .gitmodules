@@ -4,3 +4,7 @@
 [submodule "ldpc_soft_py"]
 	path = ldpc_soft_py
 	url = https://github.com/and-kirill/ldpc_soft_py
+[submodule "simulator_rm_awgn_python"]
+	path = simulator_rm_awgn_python
+	url = https://github.com/polkkkkkkkk/simulator_rm_awgn_python
+
